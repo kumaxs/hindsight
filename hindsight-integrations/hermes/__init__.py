@@ -453,6 +453,24 @@ def _coerce_bool(value) -> bool | None:
     return None
 
 
+def _safe_url_path_segment(value, *, field: str) -> str:
+    """Percent-encode *value* for safe interpolation into a URL path segment.
+
+    ``quote(..., safe="")`` covers the injection face (/, ?, #, control chars all
+    become %XX), so a hostile bank_id/memory_id can no longer change the
+    path/query boundary. Blank and raw-NUL inputs are rejected outright: an
+    empty segment silently drops a path component, and NUL cannot be encoded.
+    """
+    import urllib.parse  # noqa: PLC0415
+
+    text = "" if value is None else str(value)
+    if not text.strip():
+        raise ValueError(f"{field} must be a non-empty string")
+    if "\x00" in text:
+        raise ValueError(f"{field} must not contain NUL bytes")
+    return urllib.parse.quote(text, safe="")
+
+
 # initialize() kwargs copied verbatim (str, stripped) onto ``self._<name>``.
 _SESSION_KWARGS = (
     "platform",
@@ -2050,8 +2068,9 @@ class HindsightMemoryProvider(MemoryProvider):
         import urllib.parse  # noqa: PLC0415
         import urllib.request  # noqa: PLC0415
 
-        encoded_id = urllib.parse.quote(memory_id, safe="")
-        url = f"{self._probe_url().rstrip('/')}/v1/default/banks/{self._bank_id}/memories/{encoded_id}"
+        encoded_id = _safe_url_path_segment(memory_id, field="memory_id")
+        encoded_bank = _safe_url_path_segment(self._bank_id, field="bank_id")
+        url = f"{self._probe_url().rstrip('/')}/v1/default/banks/{encoded_bank}/memories/{encoded_id}"
         body = {"state": state}
         if reason:
             body["reason"] = reason
@@ -2081,13 +2100,14 @@ class HindsightMemoryProvider(MemoryProvider):
         matches. Surfaces truncation when ``total > len(items)``.
         """
         import urllib.error
-        import urllib.parse
+        import urllib.parse  # noqa: PLC0415
         import urllib.request
 
         encoded_query = urllib.parse.quote(query, safe="")
+        encoded_bank = _safe_url_path_segment(self._bank_id, field="bank_id")
         url = (
             f"{self._probe_url().rstrip('/')}"
-            f"/v1/default/banks/{self._bank_id}/memories/list"
+            f"/v1/default/banks/{encoded_bank}/memories/list"
             f"?q={encoded_query}&state=invalidated&limit=50"
         )
         req = urllib.request.Request(url, headers={})
@@ -2131,8 +2151,9 @@ class HindsightMemoryProvider(MemoryProvider):
         import urllib.parse
         import urllib.request
 
-        encoded_id = urllib.parse.quote(memory_id, safe="")
-        url = f"{self._probe_url().rstrip('/')}/v1/default/banks/{self._bank_id}/memories/{encoded_id}"
+        encoded_id = _safe_url_path_segment(memory_id, field="memory_id")
+        encoded_bank = _safe_url_path_segment(self._bank_id, field="bank_id")
+        url = f"{self._probe_url().rstrip('/')}/v1/default/banks/{encoded_bank}/memories/{encoded_id}"
         req = urllib.request.Request(url, headers={})
         if self._api_key:
             req.add_header("Authorization", f"Bearer {self._api_key}")

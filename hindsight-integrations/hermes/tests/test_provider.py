@@ -1003,6 +1003,82 @@ class TestHttpHelpersWire:
         assert isinstance(body, dict)
         instance.shutdown()
 
+    def test_patch_memory_encodes_a_hostile_bank_id(self, provider, _http_server):
+        """A bank_id with /?#= cannot change the PATCH path/query boundary."""
+        instance, _ = provider({})
+        base_url, captured = _http_server
+        instance._api_url = base_url
+        instance._timeout = 5
+        instance._bank_id = "../../other-bank?x="
+        instance._http_patch_memory("abc", "invalidated", reason="r")
+        assert captured["path"] == "/v1/default/banks/..%2F..%2Fother-bank%3Fx%3D/memories/abc"
+        instance.shutdown()
+
+    def test_list_invalidated_encodes_a_hostile_bank_id(self, provider, _http_server):
+        """A bank_id with ?# cannot break out of the /memories/list path segment."""
+        instance, _ = provider({})
+        base_url, captured = _http_server
+        instance._api_url = base_url
+        instance._timeout = 5
+        instance._bank_id = "b?#"
+        instance._http_list_invalidated("server")
+        assert captured["path"] == "/v1/default/banks/b%3F%23/memories/list?q=server&state=invalidated&limit=50"
+        instance.shutdown()
+
+    def test_get_memory_encodes_a_hostile_bank_id(self, provider, _http_server):
+        """A bank_id with / stays a single path segment on GET /memories/{id}."""
+        instance, _ = provider({})
+        base_url, captured = _http_server
+        instance._api_url = base_url
+        instance._timeout = 5
+        instance._bank_id = "a/b"
+        instance._http_get_memory("abc")
+        assert captured["path"] == "/v1/default/banks/a%2Fb/memories/abc"
+        instance.shutdown()
+
+    def test_normal_bank_id_stays_unencoded(self, provider, _http_server):
+        """No regression: a plain bank_id wires through verbatim on all three paths."""
+        instance, _ = provider({})
+        base_url, captured = _http_server
+        instance._api_url = base_url
+        instance._timeout = 5
+        instance._bank_id = "hermes"
+        instance._http_patch_memory("abc", "valid")
+        assert "/v1/default/banks/hermes/memories/abc" in captured["path"]
+        instance._http_get_memory("abc")
+        assert "/v1/default/banks/hermes/memories/abc" in captured["path"]
+        instance._http_list_invalidated("q")
+        assert "/v1/default/banks/hermes/memories/list" in captured["path"]
+        assert "%2F" not in captured["path"]
+        instance.shutdown()
+
+    def test_blank_bank_id_fails_closed_on_the_wire(self, provider, _http_server):
+        """An empty bank_id raises before any request goes out (fails closed)."""
+        instance, _ = provider({})
+        base_url, captured = _http_server
+        instance._api_url = base_url
+        instance._timeout = 5
+        instance._bank_id = ""
+        with pytest.raises(ValueError, match="bank_id"):
+            instance._http_patch_memory("abc", "valid")
+        with pytest.raises(ValueError, match="bank_id"):
+            instance._http_list_invalidated("q")
+        with pytest.raises(ValueError, match="bank_id"):
+            instance._http_get_memory("abc")
+        assert captured["method"] == ""  # the dummy server saw no request
+        instance.shutdown()
+
+    def test_safe_url_path_segment_rejects_blank_and_nul(self):
+        """Unit contract of _safe_url_path_segment: encode the injection face,
+        refuse what encoding cannot express."""
+        assert plugin._safe_url_path_segment("a/b?c#d\ne", field="bank_id") == "a%2Fb%3Fc%23d%0Ae"
+        with pytest.raises(ValueError, match="bank_id"):
+            plugin._safe_url_path_segment("", field="bank_id")
+        with pytest.raises(ValueError, match="bank_id"):
+            plugin._safe_url_path_segment("   ", field="bank_id")
+        with pytest.raises(ValueError, match="NUL"):
+            plugin._safe_url_path_segment("a\x00b", field="bank_id")
+
     def test_http_list_surfaces_http_error_bodies(self, provider, _http_server, monkeypatch):
         """HTTPError → RuntimeError with the code and a body excerpt."""
         import urllib.error

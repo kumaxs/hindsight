@@ -251,9 +251,9 @@ The lookup stops at the repository root. Only `bank_id` is read.
 >
 > Previously recall returned all three fact types. It now returns only observations.
 >
-> Per [Hindsight's docs](https://hindsight.vectorize.io/developer/observations), observations are the **consolidated** knowledge layer Hindsight builds on top of raw facts: deduplicated beliefs grounded in evidence, refined as new facts arrive, with proof counts and freshness signals. Raw `world` / `experience` facts are the individual supporting evidence that feeds them. For per-turn context injection, observations are denser per token and avoid feeding the model multiple raw facts that one observation already summarizes.
+> Per [Hindsight's docs](https://hindsight.vectorize.io/developer/observations), observations are the **consolidated** knowledge layer Hindsight builds on top of raw facts: deduplicated beliefs grounded in evidence, refined as new facts arrive, with proof counts and freshness signals. Raw `world` / `experience` facts are the individual supporting evidence that feeds them. For per-turn context injection, observations are denser per token and avoid feeding the model multiple raw facts that one observation already summarizes. The `hindsight_recall` tool accepts an optional per-call `types` parameter to override the default for a single invocation.
 >
-> Restore the broad recall with `"recall_types": "observation,world,experience"` (string or JSON list) in `~/.hermes/hindsight/config.json`. This applies to **both** auto-recall and the `hindsight_recall` tool — both read the same `recall_types` setting (the tool schema has no per-call `types` argument), so narrowing the default narrows both paths.
+> Restore the broad recall with `"recall_types": "observation,world,experience"` (string or JSON list) in `~/.hermes/hindsight/config.json`. Or override per-call via the tool's `types` parameter (e.g. `["world", "experience"]`).
 
 > **Tip — `recall_min_scores` against off-topic recall.** Recall ranks, it does not judge relevance: a question
 > unrelated to anything stored still comes back with up to `recall_max_tokens` of the least-bad memories. The
@@ -321,8 +321,9 @@ Available in `hybrid` and `tools` memory modes:
 | Tool | Description |
 |------|-------------|
 | `hindsight_retain` | Store information with auto entity extraction; supports optional per-call `tags` |
-| `hindsight_recall` | Multi-strategy search (semantic + entity graph) |
+| `hindsight_recall` | Multi-strategy search (semantic + entity graph); supports optional `types` param |
 | `hindsight_reflect` | Cross-memory synthesis (LLM-powered) |
+| `hindsight_invalidate` | Soft-delete or restore memories (world/experience only). Two modes: mutation (invalidate/restore by ID, `reason` required when invalidating) and discovery (search for previously-invalidated memories by query). Use query mode to find IDs, then mutation mode to restore. Invalidating an observation redirects to its curatable source facts. |
 
 ## Environment Variables
 
@@ -399,6 +400,12 @@ cat ~/.hindsight/profiles/<profile>.log    # daemon runtime
 
 **Recall returns nothing** — memories need at least one retain cycle, and extraction is an LLM call.
 Store a fact, then ask about it on a later turn.
+
+**`hindsight_invalidate` refuses to invalidate** — only `world`/`experience` facts can be curated;
+observations are derived and regenerate from their source facts. On an observation the tool names
+its source facts ("Retire one of its source facts instead: …") so you can invalidate one of those
+instead. The discovery path (call with `query`) lists previously-invalidated memories and their
+full IDs.
 
 ## Development
 

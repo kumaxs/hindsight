@@ -304,6 +304,35 @@ def test_recall_raises_when_the_primary_bank_fails():
         provider._recall("query")
 
 
+def _capture_multibank_recall(provider, answers: dict) -> list[dict]:
+    """Route recall through a recording client: one entry per bank with the exact kwargs sent."""
+    captured = []
+
+    class _Client:
+        async def arecall(self, bank_id, **kwargs):
+            captured.append({"bank_id": bank_id, **kwargs})
+            return SimpleNamespace(results=[SimpleNamespace(text=t) for t in answers.get(bank_id, [])])
+
+    provider._run_hindsight_operation = lambda op: asyncio.run(op(_Client()))
+    return captured
+
+
+def test_recall_exclude_tags_fans_out_to_every_bank_with_the_same_kwargs():
+    provider = _provider_with({"bank_id": "primary", "recall_additional_banks": ["vault"]})
+    provider._apply_recall_settings({"recall_exclude_tags": "source:bot"})
+    captured = _capture_multibank_recall(provider, {"primary": ["from primary"], "vault": ["from vault"]})
+
+    texts = [r.text for r in provider._recall("query")]
+
+    assert texts == ["from primary", "from vault"]
+    assert [call["bank_id"] for call in captured] == ["primary", "vault"]
+    expected_group = [{"not": {"tags": ["source:bot"], "match": "any_strict"}}]
+    assert captured[0]["tag_groups"] == expected_group
+    assert captured[1]["tag_groups"] == expected_group
+    # tag_groups and tags/tags_match stay mutually exclusive on every bank.
+    assert all("tags" not in call and "tags_match" not in call for call in captured)
+
+
 def test_single_bank_recall_error_reaches_the_tool_as_a_failure():
     provider = _provider_with({"bank_id": "primary"})
     _fake_recall(provider, {"primary": RuntimeError("connection refused")})

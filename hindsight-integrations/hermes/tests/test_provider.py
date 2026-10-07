@@ -1,12 +1,16 @@
 """The provider driven through the Hermes MemoryProvider interface, asserting what it
 sends to Hindsight (a recording fake client stands in for the real SDK)."""
 
+import asyncio
 import json
 import sys
 from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
 
 import hindsight_hermes as plugin
-from conftest import FakeClient
+from conftest import FakeClient, FakeResult
 from hindsight_client_api.exceptions import NotFoundException
 
 
@@ -63,7 +67,7 @@ def test_recall_tool_queries_the_bank_and_formats_results(provider):
     assert fake.recalls[0]["bank_id"] == "team"
     assert fake.recalls[0]["budget"] == "high"
     assert fake.recalls[0]["types"] == ["observation"]  # observation-only default
-    assert result["result"] == "1. fact one\n2. fact two"
+    assert result["result"] == "1. id=? fact one\n2. id=? fact two"
     instance.shutdown()
 
 
@@ -109,7 +113,7 @@ def test_recall_min_scores_is_enforced_on_each_result_the_server_returns(provide
     results = [("kept", {"semantic": 0.7}), ("weak", {"semantic": 0.3}), ("other arm", {"semantic": None})]
     instance, fake = provider({"recall_min_scores": {"semantic": 0.5}}, client=FakeClient(recall_texts=results))
     result = json.loads(instance.handle_tool_call("hindsight_recall", {"query": "q"}))
-    assert result["result"] == "1. kept"
+    assert result["result"] == "1. id=? kept"
     assert fake.recalls[0]["min_scores"] == {"semantic": 0.5}
     instance.shutdown()
 
@@ -200,6 +204,7 @@ def test_context_mode_hides_tools_tools_mode_skips_recall(provider):
         "hindsight_retain",
         "hindsight_recall",
         "hindsight_reflect",
+        "hindsight_invalidate",
     ]
     assert tools_only.prefetch("anything") == ""
     assert fake.recalls == []
@@ -450,3 +455,661 @@ def test_retain_strategy_is_exposed_as_a_setting(provider):
     instance, _ = provider()
     keys = {option["key"] for option in instance.get_config_schema()}
     assert "retain_strategy" in keys
+
+
+# ---------------------------------------------------------------------------
+# invalidate/restore memory curation (ported from hermes-agent#68206)
+# ---------------------------------------------------------------------------
+
+
+def _recalled(result: FakeResult, memory_id: str | None):
+    """A FakeResult carrying the SDK's ``id`` attribute when the server supplies it."""
+    result.id = memory_id
+    return result
+
+
+def _recall_with_ids(fake: FakeClient, *pairs: tuple[str, str | None]) -> None:
+    """Give the fake's pending recall response results with SDK-like ``id`` attributes.
+
+    ``fake._recall_texts`` only carries texts (or ``(text, scores)`` tuples) into
+    FakeRecallResponse, which re-wraps each entry in a fresh FakeResult — so an id
+    riding along on the original object is lost. Mock the arecall call directly with
+    plain SimpleNamespace results the way the SDK would return them instead."""
+    instance = SimpleNamespace(results=[_recalled(FakeResult(text), memory_id) for text, memory_id in pairs])
+    fake.arecall = _mk_arecall(instance)
+
+
+def _mk_arecall(resp):
+    async def arecall(**kwargs):
+        return resp
+
+    return arecall
+
+
+def test_get_tool_schemas_returns_four(provider):
+    instance, _ = provider({})
+    schemas = instance.get_tool_schemas()
+    assert len(schemas) == 4
+    names = {s["name"] for s in schemas}
+    assert names == {"hindsight_retain", "hindsight_recall", "hindsight_reflect", "hindsight_invalidate"}
+    instance.shutdown()
+
+
+def test_recall_ids_are_full_never_truncated(provider):
+    """Full IDs rule: recall prints the whole id, no 12-character prefix cut
+    (the #68207 truncation was reviewed down)."""
+    instance, fake = provider({})
+    _recall_with_ids(
+        fake,
+        ("Memory 1", "5e79c849-f3b6-4a1e-b789-123456789abc"),
+        ("Memory 2", "baee4d5b-84bd-4c3e-9f12-abcdef123456"),
+    )
+    result = json.loads(instance.handle_tool_call("hindsight_recall", {"query": "test"}))
+    assert "id=5e79c849-f3b6-4a1e-b789-123456789abc" in result["result"]
+    assert "id=baee4d5b-84bd-4c3e-9f12-abcdef123456" in result["result"]
+    instance.shutdown()
+
+
+def test_recall_missing_id_shows_question_mark(provider):
+    """A result without an id attribute degrades to ``id=?`` gracefully."""
+    instance, fake = provider({})
+    _recall_with_ids(fake, ("No ID memory", None))
+    result = json.loads(instance.handle_tool_call("hindsight_recall", {"query": "test"}))
+    assert "id=?" in result["result"]
+    assert "No ID memory" in result["result"]
+    instance.shutdown()
+
+
+def test_recall_types_override_hits_the_client_kwargs(provider):
+    """Agent-provided types param overrides the default recall_types."""
+    instance, fake = provider({})
+    instance.handle_tool_call("hindsight_recall", {"query": "test", "types": ["world", "experience"]})
+    assert fake.recalls[0]["types"] == ["world", "experience"]
+    instance.shutdown()
+
+
+def test_recall_without_types_uses_default(provider):
+    """When types is omitted, the configured default observation filter applies."""
+    instance, fake = provider({})
+    instance.handle_tool_call("hindsight_recall", {"query": "test"})
+    assert fake.recalls[0]["types"] == ["observation"]
+    instance.shutdown()
+
+
+def test_recall_types_override_applies_to_one_call_only(provider):
+    instance, fake = provider({})
+    instance.handle_tool_call("hindsight_recall", {"query": "q", "types": ["world"]})
+    instance.handle_tool_call("hindsight_recall", {"query": "q"})
+    assert [c["types"] for c in fake.recalls] == [["world"], ["observation"]]
+    instance.shutdown()
+
+
+def test_recall_types_override_reaches_the_prefetch_path_too(provider):
+    """The per-call override is a tool argument; the prefetch keeps the config default."""
+    instance, fake = provider({"recall_sync": True})
+    instance.prefetch("anything")
+    assert fake.recalls[0]["types"] == ["observation"]
+    instance.shutdown()
+
+
+class _RecordingUpdateMemory:
+    """Stand-in for the SDK path that records what the plugin asked the API to do."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def __call__(self, **kwargs):
+        request = kwargs.get("update_memory_request")
+        self.calls.append(
+            kwargs | {"state": getattr(request, "state", None), "reason": getattr(request, "reason", None)}
+        )
+        return SimpleNamespace()
+
+
+def _wire_sdk_update(instance, monkeypatch) -> _RecordingUpdateMemory:
+    recording = _RecordingUpdateMemory()
+
+    class _Req:
+        def __init__(self, state=None, **kwargs):
+            self.state = state
+            self.reason = None
+
+    monkeypatch.setattr(instance, "_try_import_update_memory_request", lambda: _Req)
+
+    def _fake_op(operation):
+        client = SimpleNamespace(memory=SimpleNamespace(update_memory=recording))
+        # The real operation awaits client.memory.update_memory(...); run that call
+        # the way _run_sync schedules it, without a real event loop dependency.
+        coroutine = operation(client)
+        if asyncio.iscoroutine(coroutine):
+            return asyncio.run(coroutine)
+        return coroutine  # a recording stand-in that returned synchronously
+
+    monkeypatch.setattr(instance, "_run_hindsight_operation", _fake_op)
+    return recording
+
+
+def test_invalidate_via_the_sdk_path(provider, monkeypatch):
+    """UpdateMemoryRequest(state='invalidated') rides client.memory.update_memory."""
+    instance, _ = provider({})
+    recording = _wire_sdk_update(instance, monkeypatch)
+
+    result = json.loads(
+        instance.handle_tool_call("hindsight_invalidate", {"memory_id": "abc-123-def", "reason": "stale info"})
+    )
+    assert recording.calls == [
+        {
+            "bank_id": instance._bank_id,
+            "memory_id": "abc-123-def",
+            "update_memory_request": recording.calls[0]["update_memory_request"],
+            "state": "invalidated",
+            "reason": "stale info",
+        }
+    ]
+    assert "invalidated" in result["result"]
+    assert "abc-123-def" in result["result"]
+    instance.shutdown()
+
+
+def test_invalidate_sdk_path_carries_the_reason_for_the_audit_trail(provider, monkeypatch):
+    """reason rides on the UpdateMemoryRequest, not just the log line."""
+    instance, _ = provider({})
+    recording = _wire_sdk_update(instance, monkeypatch)
+
+    instance.handle_tool_call("hindsight_invalidate", {"memory_id": "abc-123", "reason": "superseded by doc X"})
+    request = recording.calls[0]["update_memory_request"]
+    assert request.state == "invalidated"
+    assert request.reason == "superseded by doc X"
+    instance.shutdown()
+
+
+def test_invalidate_restore_sets_state_valid(provider, monkeypatch):
+    """restore=true → state=valid; restore never needs a reason."""
+    instance, _ = provider({})
+    recording = _wire_sdk_update(instance, monkeypatch)
+
+    result = json.loads(instance.handle_tool_call("hindsight_invalidate", {"memory_id": "abc-123", "restore": True}))
+    assert recording.calls[0]["update_memory_request"].state == "valid"
+    assert "restored" in result["result"]
+    instance.shutdown()
+
+
+def test_invalidate_string_restore_false_means_invalidate(provider, monkeypatch):
+    """A string 'false' must never act as a truthy flag — it means invalidate."""
+    instance, _ = provider({})
+    recording = _wire_sdk_update(instance, monkeypatch)
+
+    result = json.loads(
+        instance.handle_tool_call(
+            "hindsight_invalidate", {"memory_id": "abc-123", "restore": "false", "reason": "stale"}
+        )
+    )
+    assert recording.calls[0]["update_memory_request"].state == "invalidated"
+    assert "invalidated" in result["result"]
+    instance.shutdown()
+
+
+def test_invalidate_requires_reason(provider, monkeypatch):
+    """Invalidating without a reason returns an error (audit-trail rule)."""
+    instance, _ = provider({})
+    monkeypatch.setattr(instance, "_try_import_update_memory_request", lambda: object)
+    result = json.loads(instance.handle_tool_call("hindsight_invalidate", {"memory_id": "abc-123-def"}))
+    assert "error" in result
+    assert "reason is required" in result["error"]
+    instance.shutdown()
+
+
+def test_invalidate_reason_whitespace_only_fails_too(provider, monkeypatch):
+    instance, _ = provider({})
+    monkeypatch.setattr(instance, "_try_import_update_memory_request", lambda: object)
+    result = json.loads(instance.handle_tool_call("hindsight_invalidate", {"memory_id": "abc", "reason": "   "}))
+    assert "error" in result
+    assert "reason is required" in result["error"]
+    instance.shutdown()
+
+
+def test_invalidate_missing_params(provider):
+    """Neither query nor memory_id returns an error payload."""
+    instance, _ = provider({})
+    result = json.loads(instance.handle_tool_call("hindsight_invalidate", {}))
+    assert "error" in result
+    instance.shutdown()
+
+
+def test_invalidate_query_mode_lists_ids_and_texts(provider, monkeypatch):
+    instance, _ = provider({})
+    monkeypatch.setattr(
+        instance,
+        "_http_list_invalidated",
+        MagicMock(
+            return_value=[
+                {"id": "abc-123", "text": "old server address"},
+                {"id": "def-456", "text": "deprecated config"},
+            ]
+        ),
+    )
+    result = json.loads(instance.handle_tool_call("hindsight_invalidate", {"query": "server"}))
+    assert "abc-123" in result["result"]
+    assert "old server address" in result["result"]
+    assert result["ids"] == ["abc-123", "def-456"]
+    instance.shutdown()
+
+
+def test_invalidate_discovery_sends_full_ids(provider, monkeypatch):
+    """Discovery surfaces the full ids array — the model reads them straight back."""
+    instance, _ = provider({})
+    ids = ["5e79c849-f3b6-4a1e-b789-123456789abc", "baee4d5b-84bd-4c3e-9f12-abcdef123456"]
+    monkeypatch.setattr(
+        instance,
+        "_http_list_invalidated",
+        MagicMock(return_value=[{"id": ids[0], "text": "Memory 1"}, {"id": ids[1], "text": "Memory 2"}]),
+    )
+    result = json.loads(instance.handle_tool_call("hindsight_invalidate", {"query": "memory"}))
+    assert result["ids"] == ids
+    instance.shutdown()
+
+
+def test_invalidate_query_no_results(provider, monkeypatch):
+    instance, _ = provider({})
+    monkeypatch.setattr(instance, "_http_list_invalidated", MagicMock(return_value=[]))
+    result = json.loads(instance.handle_tool_call("hindsight_invalidate", {"query": "nonexistent"}))
+    assert "No invalidated memories" in result["result"]
+    instance.shutdown()
+
+
+def test_invalidate_query_and_id_mutually_exclusive(provider):
+    instance, _ = provider({})
+    result = json.loads(instance.handle_tool_call("hindsight_invalidate", {"query": "test", "memory_id": "abc-123"}))
+    assert "error" in result
+    instance.shutdown()
+
+
+def test_invalidate_http_fallback_when_the_sdk_lacks_update_memory(provider, monkeypatch):
+    instance, _ = provider({})
+    monkeypatch.setattr(instance, "_try_import_update_memory_request", lambda: None)
+    patcher = MagicMock()
+    monkeypatch.setattr(instance, "_http_patch_memory", patcher)
+    result = json.loads(
+        instance.handle_tool_call("hindsight_invalidate", {"memory_id": "abc-123-def", "reason": "stale info"})
+    )
+    patcher.assert_called_once_with("abc-123-def", "invalidated", reason="stale info")
+    assert "invalidated" in result["result"]
+    instance.shutdown()
+
+
+def test_invalidate_api_errors_are_surfaced(provider, monkeypatch):
+    instance, _ = provider({})
+    monkeypatch.setattr(instance, "_try_import_update_memory_request", lambda: None)
+    monkeypatch.setattr(
+        instance,
+        "_http_patch_memory",
+        MagicMock(side_effect=RuntimeError("HTTP 422: observation type cannot be invalidated")),
+    )
+    result = json.loads(instance.handle_tool_call("hindsight_invalidate", {"memory_id": "obs-123", "reason": "stale"}))
+    assert "error" in result
+    assert "422" in result["error"]
+    instance.shutdown()
+
+
+def test_invalidate_observation_refusal_redirects_to_source_facts(provider, monkeypatch):
+    """Observations regenerate from their source memories: name them instead."""
+    instance, _ = provider({})
+    monkeypatch.setattr(instance, "_try_import_update_memory_request", lambda: None)
+    monkeypatch.setattr(
+        instance,
+        "_http_patch_memory",
+        MagicMock(
+            side_effect=RuntimeError(
+                "HTTP 422: only world/experience facts can be curated; "
+                "observations are derived and regenerate from their sources"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        instance,
+        "_http_get_memory",
+        MagicMock(
+            return_value={
+                "source_memories": [
+                    {
+                        "id": "d658bf5a-1111",
+                        "text": "User meets the vendor for contract review next Wednesday",
+                        "type": "world",
+                    },
+                    {"id": "d658bf5a-2222", "text": "another source fact", "type": "world"},
+                ]
+            }
+        ),
+    )
+    result = json.loads(instance.handle_tool_call("hindsight_invalidate", {"memory_id": "obs-123", "reason": "stale"}))
+    assert "error" in result
+    assert "Retire one of its source facts instead" in result["error"]
+    assert "d658bf5a-1111" in result["error"]
+    instance.shutdown()
+
+
+def test_invalidate_observation_hint_names_every_source(provider, monkeypatch):
+    instance, _ = provider({})
+    monkeypatch.setattr(instance, "_try_import_update_memory_request", lambda: None)
+    monkeypatch.setattr(
+        instance,
+        "_http_patch_memory",
+        MagicMock(side_effect=RuntimeError("HTTP 422: observations are derived (world/experience only)")),
+    )
+    monkeypatch.setattr(
+        instance,
+        "_http_get_memory",
+        MagicMock(
+            return_value={
+                "source_memories": [
+                    {"id": "src-1", "text": "source one"},
+                    {"id": "src-2", "text": "source two"},
+                ]
+            }
+        ),
+    )
+    result = json.loads(instance.handle_tool_call("hindsight_invalidate", {"memory_id": "obs-1", "reason": "stale"}))
+    assert "src-1" in result["error"] and "src-2" in result["error"]
+    instance.shutdown()
+
+
+def test_invalidate_unrelated_error_gets_no_source_hint(provider, monkeypatch):
+    """An error about something else must not trigger the source-facts lookup."""
+    instance, _ = provider({})
+    monkeypatch.setattr(instance, "_try_import_update_memory_request", lambda: None)
+    monkeypatch.setattr(instance, "_http_patch_memory", MagicMock(side_effect=RuntimeError("HTTP 500: internal")))
+    get_memory = MagicMock()
+    monkeypatch.setattr(instance, "_http_get_memory", get_memory)
+    result = json.loads(instance.handle_tool_call("hindsight_invalidate", {"memory_id": "abc", "reason": "x"}))
+    assert "error" in result
+    get_memory.assert_not_called()
+    instance.shutdown()
+
+
+def test_invalidate_observation_without_sources_hint_stays_empty(provider, monkeypatch):
+    instance, _ = provider({})
+    monkeypatch.setattr(instance, "_try_import_update_memory_request", lambda: None)
+    monkeypatch.setattr(
+        instance,
+        "_http_patch_memory",
+        MagicMock(
+            side_effect=RuntimeError("HTTP 422: only world/experience facts can be curated; observations derive")
+        ),
+    )
+    monkeypatch.setattr(instance, "_http_get_memory", MagicMock(return_value={"source_memories": []}))
+    result = json.loads(instance.handle_tool_call("hindsight_invalidate", {"memory_id": "obs-1", "reason": "x"}))
+    assert "error" in result
+    assert "Retire one of its source facts" not in result["error"]
+    instance.shutdown()
+
+
+def test_invalidate_targets_the_primary_bank_only(provider, monkeypatch):
+    """Curation targets the primary bank — extra banks are mirrors, not owners."""
+    instance, _ = provider({"additional_banks": "mirror-a, mirror-b"})
+    recording = _wire_sdk_update(instance, monkeypatch)
+
+    instance.handle_tool_call("hindsight_invalidate", {"memory_id": "abc", "reason": "stale"})
+    assert recording.calls[0]["bank_id"] == instance._bank_id
+    assert len(recording.calls) == 1
+    instance.shutdown()
+
+
+def test_coerce_bool_accepts_the_usual_spellings():
+    for value, expected in {
+        "true": True,
+        "TRUE": True,
+        "1": True,
+        "yes": True,
+        "on": True,
+        "false": False,
+        "0": False,
+        "no": False,
+        "off": False,
+        " False ": False,
+        None: None,
+        True: True,
+        False: False,
+        "garbage": None,
+    }.items():
+        assert plugin._coerce_bool(value) is expected
+
+
+def test_system_prompt_names_the_invalidate_tool(provider):
+    instance, _ = provider({})
+    block = instance.system_prompt_block()
+    assert "hindsight_invalidate" in block
+    instance.shutdown()
+
+
+class TestHttpHelpersWire:
+    """Wire-level tests for _http_list_invalidated/_http_patch_memory/_http_get_memory:
+    a local ThreadingHTTPServer records the requests the plugin actually sends."""
+
+    @pytest.fixture()
+    def _http_server(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        captured = {"path": "", "method": "", "body": b"", "headers": {}}
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                captured["path"] = self.path
+                captured["method"] = "GET"
+                captured["headers"] = dict(self.headers)
+                resp = json.dumps(
+                    {
+                        "items": [
+                            {"id": "abc-123", "text": "old server address"},
+                        ],
+                        "total": 1,
+                        "limit": 50,
+                        "offset": 0,
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+
+            def do_PATCH(self):
+                captured["path"] = self.path
+                captured["method"] = "PATCH"
+                captured["headers"] = dict(self.headers)
+                length = int(self.headers.get("Content-Length", 0))
+                captured["body"] = self.rfile.read(length)
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        yield f"http://127.0.0.1:{port}", captured
+        server.shutdown()
+
+    def test_list_invalidated_endpoint_with_query_state_and_limit(self, provider, _http_server):
+        """_http_list_invalidated hits /memories/list with q=, state=invalidated, limit=50."""
+        instance, _ = provider({})
+        base_url, captured = _http_server
+        instance._api_url = base_url
+        instance._timeout = 5
+        result = instance._http_list_invalidated("server")
+        assert result == [{"id": "abc-123", "text": "old server address"}]
+        assert "/memories/list" in captured["path"]
+        assert "q=server" in captured["path"]
+        assert "state=invalidated" in captured["path"]
+        assert "limit=50" in captured["path"]
+        assert captured["method"] == "GET"
+        instance.shutdown()
+
+    def test_wire_list_sends_the_bearer_token_only_when_a_key_exists(self, provider, _http_server):
+        """Bearer is added only when _api_key holds a value."""
+        instance, _ = provider({})
+        base_url, captured = _http_server
+        instance._api_url = base_url
+        instance._timeout = 5
+        instance._http_list_invalidated("q")
+        assert captured["headers"].get("Authorization") == "Bearer test-key"
+        instance.shutdown()
+
+    def test_wire_list_without_a_key_ships_no_authorization_header(self, provider, _http_server):
+        instance, _ = provider({})
+        base_url, captured = _http_server
+        instance._api_url = base_url
+        instance._timeout = 5
+        instance._api_key = ""
+        instance._http_list_invalidated("q")
+        assert "Authorization" not in captured["headers"]
+        instance.shutdown()
+
+    def test_patch_memory_encodes_the_id_and_carries_state_and_reason(self, provider, _http_server):
+        instance, _ = provider({})
+        base_url, captured = _http_server
+        instance._api_url = base_url
+        instance._timeout = 5
+        instance._http_patch_memory("abc#frag?x=1", "invalidated", reason="stale info")
+        assert captured["method"] == "PATCH"
+        assert "abc%23frag%3Fx%3D1" in captured["path"]
+        assert "#" not in captured["path"]
+        body = json.loads(captured["body"].decode("utf-8"))
+        assert body == {"state": "invalidated", "reason": "stale info"}
+        instance.shutdown()
+
+    def test_patch_memory_omits_reason_when_there_is_none(self, provider, _http_server):
+        instance, _ = provider({})
+        base_url, captured = _http_server
+        instance._api_url = base_url
+        instance._timeout = 5
+        instance._http_patch_memory("abc", "valid", reason=None)
+        body = json.loads(captured["body"].decode("utf-8"))
+        assert body == {"state": "valid"}
+        instance.shutdown()
+
+    def test_get_memory_hits_the_singular_memory_path(self, provider, _http_server):
+        """_http_get_memory must hit /memories/{id}, NOT /memories/list."""
+        instance, _ = provider({})
+        base_url, captured = _http_server
+        instance._api_url = base_url
+        instance._timeout = 5
+        body = instance._http_get_memory("abc#frag")
+        assert captured["method"] == "GET"
+        assert "/memories/abc%23frag" in captured["path"]
+        assert "/memories/list" not in captured["path"]
+        assert isinstance(body, dict)
+        instance.shutdown()
+
+    def test_http_list_surfaces_http_error_bodies(self, provider, _http_server, monkeypatch):
+        """HTTPError → RuntimeError with the code and a body excerpt."""
+        import urllib.error
+
+        instance, _ = provider({})
+        base_url, _ = _http_server
+        instance._api_url = base_url
+        instance._timeout = 5
+
+        def _raise(url, **kwargs):  # noqa: ARG001
+            raise urllib.error.HTTPError(url, 403, "forbidden", hdrs=None, fp=None)
+
+        monkeypatch.setattr("urllib.request.urlopen", _raise)
+        with pytest.raises(RuntimeError, match="HTTP 403"):
+            instance._http_list_invalidated("q")
+        instance.shutdown()
+
+    def test_probe_url_prefers_the_running_embedded_client(self, provider):
+        """Embedded dynamic-port resolution: client URL → daemon URL → api_url (the
+        _resolve_retain_target ordering); cloud mode ignores the client entirely."""
+        instance, _ = provider({})
+        client = SimpleNamespace(url="http://127.0.0.1:12345")
+        instance._mode = "local_embedded"
+        instance._client = client
+        instance._embedded_url = "http://127.0.0.1:99999"
+        instance._api_url = "https://api.hindsight.vectorize.io"
+        assert instance._probe_url() == "http://127.0.0.1:12345"
+        # No URL on the client → the daemon URL captured at start.
+        client.url = ""
+        assert instance._probe_url() == "http://127.0.0.1:99999"
+        # Both empty → api_url.
+        instance._embedded_url = ""
+        assert instance._probe_url() == "https://api.hindsight.vectorize.io"
+        # Cloud mode ignores the embedded client entirely.
+        instance._mode = "cloud"
+        assert instance._probe_url() == "https://api.hindsight.vectorize.io"
+        instance.shutdown()
+
+
+class TestInvalidateSchemaContract:
+    """The schema itself: two-mode description, reason wording, restore flag, types enum."""
+
+    def test_schema_names_and_shape(self, provider):
+        instance, _ = provider({})
+        schema = next(s for s in instance.get_tool_schemas() if s["name"] == "hindsight_invalidate")
+        assert schema["parameters"]["type"] == "object"
+        props = schema["parameters"]["properties"]
+        assert set(props) == {"query", "memory_id", "reason", "restore"}
+        assert props["restore"]["default"] is False
+        instance.shutdown()
+
+    def test_schema_carries_the_two_modes_and_reason_wording(self, provider):
+        instance, _ = provider({})
+        schema = next(s for s in instance.get_tool_schemas() if s["name"] == "hindsight_invalidate")
+        description = schema["description"]
+        assert "TWO MODES" in description
+        assert "memory_id" in description and "query" in description
+        assert "audit" in description
+        reason_description = schema["parameters"]["properties"]["reason"]["description"]
+        assert "REQUIRED" in reason_description
+        assert "invalidation_reason" in reason_description
+        assert "Not needed" in reason_description  # restoring needs no reason
+        instance.shutdown()
+
+    def test_recall_schema_advertises_the_types_override(self, provider):
+        instance, _ = provider({})
+        schema = next(s for s in instance.get_tool_schemas() if s["name"] == "hindsight_recall")
+        types_param = schema["parameters"]["properties"]["types"]
+        assert types_param["items"]["enum"] == ["world", "experience", "observation"]
+        assert "Overrides the configured default" in types_param["description"]
+        assert schema["parameters"]["required"] == ["query"]
+        instance.shutdown()
+
+    def test_recall_schema_warns_only_world_experience_can_be_invalidated(self, provider):
+        instance, _ = provider({})
+        schema = next(s for s in instance.get_tool_schemas() if s["name"] == "hindsight_recall")
+        assert "Only world/experience facts can be invalidated" in schema["description"]
+        instance.shutdown()
+
+
+class TestSdkGuard:
+    """_try_import_update_memory_request: the lazy-import compatibility guard."""
+
+    def test_the_real_import_returns_the_class_on_the_current_floor(self, provider):
+        instance, _ = provider({})
+        from hindsight_client_api.models.update_memory_request import UpdateMemoryRequest as Real
+
+        assert instance._try_import_update_memory_request() is Real
+        instance.shutdown()
+
+    def test_a_missing_module_returns_none_and_falls_back_to_http(self, provider, monkeypatch):
+        instance, _ = provider({})
+        import builtins
+
+        real_import = builtins.__import__
+
+        def _blocked(name, *args, **kwargs):
+            if name.startswith("hindsight_client_api.models.update_memory_request"):
+                raise ImportError(name)
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _blocked)
+        assert instance._try_import_update_memory_request() is None
+        # And the tool call takes the HTTP path end to end:
+        patcher = MagicMock()
+        monkeypatch.setattr(instance, "_http_patch_memory", patcher)
+        result = json.loads(instance.handle_tool_call("hindsight_invalidate", {"memory_id": "abc", "reason": "stale"}))
+        assert patcher.called
+        assert "invalidated" in result["result"]
+        instance.shutdown()

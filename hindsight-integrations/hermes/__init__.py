@@ -478,6 +478,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
         self._last_recall_returned, self._last_recall_count = False, 0
+        self._recall_exclude_tags: List[str] = []
         self._apply_recall_settings({})
 
     @property
@@ -678,6 +679,11 @@ class HindsightMemoryProvider(MemoryProvider):
                 "description": "Tag matching mode for recall",
                 "default": "any",
                 "choices": ["any", "all", "any_strict", "all_strict"],
+            },
+            {
+                "key": "recall_exclude_tags",
+                "description": "Comma-separated tags to EXCLUDE from recall, sent as Hindsight's tag_groups NOT filter. Use e.g. 'source:bot' to keep agent-to-agent turns out of normal recall while keeping untagged history intact. Empty disables. Requires hindsight-client >= 0.10.0.",
+                "default": "",
             },
             {
                 "key": "recall_types",
@@ -1104,7 +1110,8 @@ class HindsightMemoryProvider(MemoryProvider):
             )
         logger.debug(
             "Hindsight config: auto_retain=%s, auto_recall=%s, retain_every_n=%d, "
-            "retain_async=%s, retain_context=%s, recall_max_tokens=%d, recall_max_input_chars=%d, tags=%s, recall_tags=%s",
+            "retain_async=%s, retain_context=%s, recall_max_tokens=%d, recall_max_input_chars=%d, "
+            "tags=%s, recall_tags=%s, recall_exclude_tags=%s",
             self._auto_retain,
             self._auto_recall,
             self._retain_every_n_turns,
@@ -1114,6 +1121,7 @@ class HindsightMemoryProvider(MemoryProvider):
             self._recall_max_input_chars,
             self._tags,
             self._recall_tags,
+            self._recall_exclude_tags,
         )
 
         if self._mode == "local_embedded":
@@ -1296,6 +1304,9 @@ class HindsightMemoryProvider(MemoryProvider):
         """Recall knobs are pure config too (``{}`` yields the defaults)."""
         self._recall_tags = cfg.get("recall_tags") or None
         self._recall_tags_match = cfg.get("recall_tags_match", "any")
+        # Exclusion list -> Hindsight ``tag_groups`` ``not`` filter. Empty (the default)
+        # keeps the legacy tags/tags_match path byte-for-byte.
+        self._recall_exclude_tags = _normalize_string_list(cfg.get("recall_exclude_tags"))
         self._auto_recall = cfg.get("auto_recall", True)
         self._recall_sync = bool(cfg.get("recall_sync", False))
         self._recall_max_tokens = int(cfg.get("recall_max_tokens", 4096))
@@ -1428,7 +1439,25 @@ class HindsightMemoryProvider(MemoryProvider):
             if i == 0 or self._extra_bank_available("recall", bank_id)
         ]
         kwargs: dict = {"query": query, "budget": self._budget, "max_tokens": self._recall_max_tokens}
-        if self._recall_tags:
+        if self._recall_exclude_tags:
+            # tag_groups is the only way to NEGATE a tag filter; the server takes it
+            # instead of tags/tags_match, so the two are mutually exclusive on the wire.
+            # ``any_strict`` inside the ``not`` is load-bearing: it matches only memories
+            # that actually carry the tag, so untagged memories (all history that predates
+            # tagging) stay recallable.
+            excluded = {"not": {"tags": self._recall_exclude_tags, "match": "any_strict"}}
+            if self._recall_tags:
+                kwargs["tag_groups"] = [
+                    {
+                        "and": [
+                            {"tags": _normalize_string_list(self._recall_tags), "match": self._recall_tags_match},
+                            excluded,
+                        ]
+                    }
+                ]
+            else:
+                kwargs["tag_groups"] = [excluded]
+        elif self._recall_tags:
             kwargs.update(tags=self._recall_tags, tags_match=self._recall_tags_match)
         if self._recall_types:
             kwargs["types"] = self._recall_types

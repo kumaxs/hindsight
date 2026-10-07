@@ -241,6 +241,7 @@ The lookup stops at the repository root. Only `bank_id` is read.
 | `recall_prompt_preamble` | — | Custom preamble for recalled memories in context |
 | `recall_tags` | — | Tags to filter when searching memories |
 | `recall_tags_match` | `any` | Tag matching mode: `any` / `all` / `any_strict` / `all_strict` |
+| `recall_exclude_tags` | — | Comma-separated tags to EXCLUDE from recall, sent as Hindsight's `tag_groups` NOT filter. e.g. `source:bot` keeps agent-to-agent turns out of normal recall while untagged history stays intact. Applies to both auto-recall and the `hindsight_recall` tool. Empty disables. Requires `hindsight-client` >= 0.10.0. |
 | `recall_types` | `observation` | Fact types surfaced by recall (both auto-recall and the `hindsight_recall` tool). Comma-separated string or JSON list. **Default narrowed to `observation` only** (see "Behavior change" below). Set to `observation,world,experience` to also include raw facts. |
 | `recall_min_scores` | — | Minimum relevance per score field, as a JSON object (e.g. `{"reranker": 0.25}` or `{"semantic": 0.5}`). Applies to both auto-recall and the `hindsight_recall` tool. See the tip below. |
 | `auto_recall` | `true` | Automatically recall memories before each turn |

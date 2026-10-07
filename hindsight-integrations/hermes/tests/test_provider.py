@@ -63,6 +63,7 @@ def test_recall_tool_queries_the_bank_and_formats_results(provider):
     assert fake.recalls[0]["bank_id"] == "team"
     assert fake.recalls[0]["budget"] == "high"
     assert fake.recalls[0]["types"] == ["observation"]  # observation-only default
+    assert "tag_groups" not in fake.recalls[0]  # no exclude filter configured
     assert result["result"] == "1. fact one\n2. fact two"
     instance.shutdown()
 
@@ -89,6 +90,117 @@ def test_recall_min_scores_accepts_the_json_string_the_setup_wizard_writes(provi
     instance.handle_tool_call("hindsight_recall", {"query": "q"})
     assert fake.recalls[0]["min_scores"] == {"reranker": 0.25}
     instance.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# recall_exclude_tags -> Hindsight tag_groups NOT filter (client floor 0.10.1)
+# ---------------------------------------------------------------------------
+
+
+class TestRecallExcludeTags:
+    """``recall_exclude_tags`` must be sent as Hindsight ``tag_groups`` (the server
+    takes it *instead of* ``tags``/``tags_match``); unset must leave the legacy
+    ``tags``/``tags_match`` path byte-for-byte intact."""
+
+    @staticmethod
+    def _capture_recall(instance, fake, texts=("kept memory",)):
+        captured = {}
+
+        async def _recall(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(results=[SimpleNamespace(text=t) for t in texts])
+
+        fake.arecall = _recall
+        return captured
+
+    def test_recall_exclude_tags_builds_not_group(self, provider):
+        instance, fake = provider({"recall_exclude_tags": "source:bot"})
+        captured = self._capture_recall(instance, fake)
+
+        results = instance._recall("hello")
+
+        assert [r.text for r in results] == ["kept memory"]
+        assert captured["tag_groups"] == [{"not": {"tags": ["source:bot"], "match": "any_strict"}}]
+        # tag_groups and tags/tags_match are mutually exclusive on the wire.
+        assert "tags" not in captured
+        assert "tags_match" not in captured
+        instance.shutdown()
+
+    def test_recall_exclude_plus_include_uses_and(self, provider):
+        instance, fake = provider(
+            {
+                "recall_tags": "project:hermes",
+                "recall_tags_match": "all",
+                "recall_exclude_tags": "source:bot",
+            }
+        )
+        captured = self._capture_recall(instance, fake)
+
+        instance._recall("hello")
+
+        assert captured["tag_groups"] == [
+            {
+                "and": [
+                    {"tags": ["project:hermes"], "match": "all"},
+                    {"not": {"tags": ["source:bot"], "match": "any_strict"}},
+                ]
+            }
+        ]
+        assert "tags" not in captured
+        assert "tags_match" not in captured
+        instance.shutdown()
+
+    def test_recall_no_exclude_keeps_legacy_path(self, provider):
+        # Neither include nor exclude configured: nothing tag-related goes on the
+        # wire — in particular no tag_groups key appears (regression guard).
+        instance, fake = provider({"recall_sync": True})
+        captured = self._capture_recall(instance, fake)
+
+        instance.prefetch("what do you know?")
+
+        assert "tag_groups" not in captured
+        assert "tags" not in captured
+        assert "tags_match" not in captured
+        instance.shutdown()
+
+    def test_recall_include_only_still_uses_legacy_tags(self, provider):
+        # Exclude empty => include-only keeps the pre-existing tags/tags_match shape.
+        # (recall_tags reaches the wire verbatim; the tag_groups composition below is
+        # the only place that needs it as a real list.)
+        instance, fake = provider({"recall_tags": ["recall-tag"], "recall_tags_match": "any", "recall_sync": True})
+        captured = self._capture_recall(instance, fake)
+
+        instance.prefetch("what do you know?")
+
+        assert captured["tags"] == ["recall-tag"]
+        assert captured["tags_match"] == "any"
+        assert "tag_groups" not in captured
+        instance.shutdown()
+
+    def test_recall_exclude_empty_string_is_noop(self, provider):
+        instance, fake = provider({"recall_exclude_tags": "", "recall_sync": True})
+        captured = self._capture_recall(instance, fake)
+
+        instance.prefetch("what do you know?")
+
+        assert "tag_groups" not in captured
+        assert "tags" not in captured
+        assert "tags_match" not in captured
+        instance.shutdown()
+
+    def test_recall_exclude_coexists_with_min_scores(self, provider):
+        # The kwargs built for tag_groups must not crowd out the min_scores floor:
+        # both settings apply to the same recall call.
+        instance, fake = provider(
+            {"recall_exclude_tags": "source:bot", "recall_min_scores": {"reranker": 0.25}, "recall_sync": True}
+        )
+        captured = self._capture_recall(instance, fake)
+
+        instance.prefetch("what do you know?")
+
+        assert captured["tag_groups"] == [{"not": {"tags": ["source:bot"], "match": "any_strict"}}]
+        assert captured["min_scores"] == {"reranker": 0.25}
+        instance.shutdown()
 
 
 def test_recall_with_an_empty_answer_stays_an_empty_block(provider):
@@ -450,3 +562,4 @@ def test_retain_strategy_is_exposed_as_a_setting(provider):
     instance, _ = provider()
     keys = {option["key"] for option in instance.get_config_schema()}
     assert "retain_strategy" in keys
+    assert "recall_exclude_tags" in keys

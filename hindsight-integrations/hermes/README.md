@@ -279,6 +279,7 @@ The lookup stops at the repository root. Only `bank_id` is read.
 | `retain_strategy` | — | Named retain strategy sent with every stored item (`HINDSIGHT_RETAIN_STRATEGY`). The bank must define it under `retain_strategies`; an unknown name is ignored by the server. Empty lets the bank decide. |
 | `retain_indicator` | `true` | Show a `👁️ Hindsight — saving to memory…` status line when a turn is saved. Turn off for customer-facing agents. |
 | `retain_user_prefix` | `User` | Label used before user turns in auto-retained transcripts |
+| `a2a_tag` | `source:bot` | Extra tag on turns authored by another bot (agent-to-agent messages), so that traffic can be kept out of normal recall later without losing the history. Marking only — it does not filter anything by itself, and `recall_tags` is NOT a substitute: `tags_match='any'` also drops memories carrying other tags (measured: 93% of a live bank's `session:*`-tagged history). Exclusion needs Hindsight's `tag_groups` NOT filter. Empty disables. |
 | `retain_assistant_prefix` | `Assistant` | Label used before assistant turns in auto-retained transcripts |
 
 ### Integration

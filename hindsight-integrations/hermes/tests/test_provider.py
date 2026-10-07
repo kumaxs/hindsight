@@ -1,11 +1,13 @@
 """The provider driven through the Hermes MemoryProvider interface, asserting what it
 sends to Hindsight (a recording fake client stands in for the real SDK)."""
 
+import inspect
 import json
 import sys
 from types import SimpleNamespace
 
 import hindsight_hermes as plugin
+import pytest
 from conftest import FakeClient
 from hindsight_client_api.exceptions import NotFoundException
 
@@ -450,3 +452,167 @@ def test_retain_strategy_is_exposed_as_a_setting(provider):
     instance, _ = provider()
     keys = {option["key"] for option in instance.get_config_schema()}
     assert "retain_strategy" in keys
+    assert "a2a_tag" in keys
+
+
+# ---------------------------------------------------------------------------
+# turn_author — bot-authored (agent-to-agent) turns
+# ---------------------------------------------------------------------------
+
+
+BOT_AUTHOR = {"id": "bot:fron", "name": "@fron", "is_bot": True}
+HUMAN_AUTHOR = {"id": "u1", "name": "Wang", "is_bot": False}
+BOT_DM = "Message from 🤖 fron (@fron): t2 done"
+
+
+class TestTurnAuthor:
+    """A bot's DM arrives as role=user but was written by a peer agent. ``turn_author``
+    carries ``is_bot``: the turn is retained in full and tagged (``a2a_tag``) so recall
+    can leave agent-to-agent traffic out. Nothing is dropped, no text is sniffed."""
+
+    def test_bot_authored_turn_carries_a2a_tag(self, provider):
+        instance, fake = provider()
+        instance.sync_turn(BOT_DM, "ack", turn_author=BOT_AUTHOR)
+        instance.shutdown()
+
+        item = _retain_item(fake)
+        assert item["tags"] == ["session:session-1", "source:bot"]
+        # Tagged, not dropped: the peer's turn is still in the retained payload.
+        assert BOT_DM in item["content"]
+
+    def test_human_turn_carries_no_a2a_tag(self, provider):
+        instance, fake = provider()
+        instance.sync_turn("hello", "hi", turn_author=HUMAN_AUTHOR)
+        instance.shutdown()
+
+        assert _retain_item(fake)["tags"] == ["session:session-1"]
+
+    def test_turn_without_author_carries_no_a2a_tag(self, provider):
+        """Older callers omit turn_author entirely — unchanged behavior."""
+        instance, fake = provider()
+        instance.sync_turn("hello", "hi")
+        instance.shutdown()
+
+        assert _retain_item(fake)["tags"] == ["session:session-1"]
+
+    def test_custom_a2a_tag_respected(self, provider):
+        instance, fake = provider({"a2a_tag": "x:y"})
+        instance.sync_turn(BOT_DM, "ack", turn_author=BOT_AUTHOR)
+        instance.shutdown()
+
+        tags = _retain_item(fake)["tags"]
+        assert "x:y" in tags
+        assert "source:bot" not in tags
+
+    @pytest.mark.parametrize("blank", ["", "   ", None])
+    def test_blank_a2a_tag_disables_tagging(self, provider, blank):
+        """An empty string, whitespace or a null YAML value disables tagging; none of
+        them may ship as a literal "None" tag."""
+        instance, fake = provider({"a2a_tag": blank})
+        instance.sync_turn(BOT_DM, "ack", turn_author=BOT_AUTHOR)
+        instance.shutdown()
+
+        assert _retain_item(fake)["tags"] == ["session:session-1"]
+
+    def test_a2a_tag_defaults_and_only_fires_for_bots(self, provider):
+        instance, _ = provider()
+        assert instance._a2a_tag == "source:bot"
+        assert instance._a2a_tag_for_turn(BOT_AUTHOR) == "source:bot"
+        assert instance._a2a_tag_for_turn(HUMAN_AUTHOR) == ""
+        assert instance._a2a_tag_for_turn({"id": "u1", "is_bot": False}) == ""
+        assert instance._a2a_tag_for_turn(None) == ""
+        instance.shutdown()
+
+    def test_bot_turn_is_buffered_like_any_other(self, provider):
+        """No special short-circuit: bot turns ship like any other — counted,
+        session-stamped, and tagged en route (append trim then clears the buffer)."""
+        instance, fake = provider()
+        instance.sync_turn(BOT_DM, "ack", session_id="s-new", turn_author=BOT_AUTHOR)
+
+        assert instance._session_id == "s-new"
+        assert instance._turn_counter == 1
+        instance.shutdown()
+
+        # The append retain shipped the turn with its tag; nothing was dropped.
+        assert _retain_item(fake, -1)["tags"] == ["session:s-new", "source:bot"]
+        assert BOT_DM in _retain_item(fake, -1)["content"]
+
+    def test_mixed_batch_splits_by_source_tag(self, provider):
+        """retain_every_n_turns > 1 (or a legacy overwrite server) can pack both kinds
+        into one batch: each job then carries only its own tag, so a peer's turn is never
+        mislabelled as the human's and a human turn never ships as agent-to-agent."""
+        instance, fake = provider({"retain_every_n_turns": 2})
+        instance.sync_turn(BOT_DM, "ack", turn_author=BOT_AUTHOR)  # turn 1: buffered
+        instance.sync_turn("hello", "hi", turn_author=HUMAN_AUTHOR)  # turn 2: flushes both
+        instance.shutdown()
+
+        assert len(fake.retains) == 2
+        bot_bodies = [
+            json.dumps(_retain_item(fake, i)["content"], ensure_ascii=False)
+            for i in range(2)
+            if "source:bot" in _retain_item(fake, i)["tags"]
+        ]
+        human_bodies = [
+            json.dumps(_retain_item(fake, i)["content"], ensure_ascii=False)
+            for i in range(2)
+            if "source:bot" not in _retain_item(fake, i)["tags"]
+        ]
+        assert len(bot_bodies) == 1 and len(human_bodies) == 1
+        assert BOT_DM in bot_bodies[0] and "hello" not in bot_bodies[0]
+        assert "hello" in human_bodies[0] and BOT_DM not in human_bodies[0]
+
+    def test_append_retain_keeps_turn_tags_aligned_after_trim(self, provider, monkeypatch):
+        """Append-mode retains drop shipped turns from ``_session_turns`` (#62950); the
+        parallel tag list must go with them. Otherwise the next batch pairs a turn with
+        an earlier turn's tag — a peer bot's turn ships untagged (into the user's recall)
+        while a human turn ships as agent-to-agent traffic."""
+        instance, fake = provider({"retain_every_n_turns": 2})  # both turns ship in the same flush
+        instance.sync_turn("hello", "hi", turn_author=HUMAN_AUTHOR)  # buffered
+        instance.sync_turn(BOT_DM, "ack", turn_author=BOT_AUTHOR)  # flushes both, split by tag
+        instance.shutdown()
+
+        assert len(fake.retains) == 2  # one job per source tag
+        human_items = [r for r in fake.retains if "source:bot" not in r["items"][0]["tags"]]
+        bot_items = [r for r in fake.retains if "source:bot" in r["items"][0]["tags"]]
+        assert len(human_items) == 1 and len(bot_items) == 1
+        assert human_items[0]["items"][0]["tags"] == ["session:session-1"]
+        assert "hello" in human_items[0]["items"][0]["content"]
+        assert BOT_DM not in human_items[0]["items"][0]["content"]
+        assert bot_items[0]["items"][0]["tags"] == ["session:session-1", "source:bot"]
+        assert BOT_DM in bot_items[0]["items"][0]["content"]
+        assert "hello" not in bot_items[0]["items"][0]["content"]
+
+    def test_append_retain_human_turn_after_bot_is_not_labelled_a2a(self, provider):
+        """Mirror of the trim-alignment case on the live append path: after a bot turn
+        is shipped and trimmed, the next human turn must not inherit its tag."""
+        instance, fake = provider()
+        instance.sync_turn(BOT_DM, "ack", turn_author=BOT_AUTHOR)  # retain + trim
+        # The parallel tag list was trimmed in lockstep with _session_turns (append).
+        assert instance._session_turns == []
+        assert instance._session_turn_tags == []
+        instance.sync_turn("hello", "hi", turn_author=HUMAN_AUTHOR)  # next turn stays human
+        instance.shutdown()
+
+        human_items = [r for r in fake.retains if "source:bot" not in r["items"][0]["tags"]]
+        bot_items = [r for r in fake.retains if "source:bot" in r["items"][0]["tags"]]
+        assert len(human_items) == 1 and len(bot_items) == 1
+        assert human_items[0]["items"][0]["tags"] == ["session:session-1"]
+        assert "hello" in human_items[0]["items"][0]["content"]
+        assert BOT_DM not in human_items[0]["items"][0]["content"]
+        assert bot_items[0]["items"][0]["tags"] == ["session:session-1", "source:bot"]
+        assert BOT_DM in bot_items[0]["items"][0]["content"]
+        assert "hello" not in bot_items[0]["items"][0]["content"]
+
+    def test_signature_accepts_turn_author_for_core_dispatch(self, provider):
+        """MemoryManager only forwards turn_author to sync_turn signatures that
+        name it, so dropping the kwarg silently re-opens this bug — pin it."""
+        instance, _ = provider()
+        assert "turn_author" in inspect.signature(instance.sync_turn).parameters
+        instance.shutdown()
+
+    def test_a2a_tag_is_exposed_as_a_setting(self, provider):
+        """Operators must be able to set it without editing code."""
+        instance, _ = provider()
+        keys = {option["key"] for option in instance.get_config_schema()}
+        assert "a2a_tag" in keys
+        instance.shutdown()

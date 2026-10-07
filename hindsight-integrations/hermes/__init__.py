@@ -689,6 +689,11 @@ class HindsightMemoryProvider(MemoryProvider):
                 "description": 'Minimum relevance per score field, as a JSON object (e.g. {"reranker": 0.25}). Recall always returns up to recall_max_tokens of the best-ranked memories even when none is relevant; memories under a floor are dropped from auto-recall and the hindsight_recall tool, so an off-topic turn injects nothing. Default: no floor',
                 "default": "",
             },
+            {
+                "key": "prefer_observations",
+                "description": "When recalling raw facts (world/experience) together with observations, drop raw facts that a consolidated observation already supersedes — no duplicate pairs. Only effective when recall_types includes raw facts; with the observation-only default the server has nothing to deduplicate. Requires Hindsight >= 0.8.4.",
+                "default": False,
+            },
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {
                 "key": "recall_sync",
@@ -1312,6 +1317,10 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_min_scores = _normalize_min_scores(cfg.get("recall_min_scores"))
         self._recall_prompt_preamble = cfg.get("recall_prompt_preamble", "")
         self._recall_indicator = bool(cfg.get("recall_indicator", True))
+        # v0.8.4+ recall parameter: send prefer_observations only when opted in, so a
+        # default config's recall request stays byte-for-byte what it is today. A
+        # bool() wrap keeps junk ("" / "false" style strings) on the false side.
+        self._prefer_observations = bool(cfg.get("prefer_observations", False))
 
     def _start_embedded_daemon(self) -> None:
         """Start the embedded daemon on a background thread (Rich output -> log file)."""
@@ -1434,6 +1443,8 @@ class HindsightMemoryProvider(MemoryProvider):
             kwargs["types"] = self._recall_types
         if self._recall_min_scores:
             kwargs["min_scores"] = self._recall_min_scores
+        if self._prefer_observations:
+            kwargs["prefer_observations"] = True
 
         async def _recall_all(client):
             extra_timeout = float(self._timeout or _DEFAULT_TIMEOUT) * _EXTRA_BANK_TIMEOUT_SHARE
